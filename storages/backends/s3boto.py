@@ -13,15 +13,12 @@ from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
 from django.utils.encoding import force_unicode, smart_str
 
 try:
-    from boto.s3.connection import S3Connection
-    from boto.exception import S3ResponseError
+    from boto.s3 import connection
     from boto.s3.key import Key
 except ImportError:
     raise ImproperlyConfigured, "Could not load Boto's S3 bindings.\
     \nSee http://code.google.com/p/boto/"
 
-ACCESS_KEY_NAME     = getattr(settings, 'AWS_ACCESS_KEY_ID', None)
-SECRET_KEY_NAME     = getattr(settings, 'AWS_SECRET_ACCESS_KEY', None)
 HEADERS             = getattr(settings, 'AWS_HEADERS', {})
 STORAGE_BUCKET_NAME = getattr(settings, 'AWS_STORAGE_BUCKET_NAME', None)
 AUTO_CREATE_BUCKET  = getattr(settings, 'AWS_AUTO_CREATE_BUCKET', True)
@@ -32,8 +29,9 @@ QUERYSTRING_EXPIRE  = getattr(settings, 'AWS_QUERYSTRING_EXPIRE', 3600)
 REDUCED_REDUNDANCY  = getattr(settings, 'AWS_REDUCED_REDUNDANCY', False)
 LOCATION            = getattr(settings, 'AWS_LOCATION', '')
 CUSTOM_DOMAIN       = getattr(settings, 'AWS_S3_CUSTOM_DOMAIN', None)
-SECURE_URLS         = getattr(settings, 'AWS_S3_SECURE_URLS', True)
 FILE_NAME_CHARSET   = getattr(settings, 'AWS_S3_FILE_NAME_CHARSET', 'utf-8')
+CALLING_FORMAT      = getattr(settings, 'AWS_BOTO_CALLING_FORMAT', 'SubdomainCallingFormat')
+FORCE_HTTP          = getattr(settings, 'AWS_BOTO_FORCE_HTTP', False)
 IS_GZIPPED          = getattr(settings, 'AWS_IS_GZIPPED', False)
 GZIP_CONTENT_TYPES  = getattr(settings, 'GZIP_CONTENT_TYPES', (
     'text/css',
@@ -78,7 +76,7 @@ class S3BotoStorage(Storage):
                        gzip=IS_GZIPPED, gzip_content_types=GZIP_CONTENT_TYPES,
                        querystring_auth=QUERYSTRING_AUTH, querystring_expire=QUERYSTRING_EXPIRE,
                        reduced_redundancy=REDUCED_REDUNDANCY,
-                       custom_domain=CUSTOM_DOMAIN, secure_urls=SECURE_URLS,
+                       custom_domain=CUSTOM_DOMAIN,
                        location=LOCATION, file_name_charset=FILE_NAME_CHARSET):
         self.bucket_acl = bucket_acl
         self.bucket_name = bucket
@@ -90,15 +88,29 @@ class S3BotoStorage(Storage):
         self.querystring_expire = querystring_expire
         self.reduced_redundancy = reduced_redundancy
         self.custom_domain = custom_domain
-        self.secure_urls = secure_urls
         self.location = location or ''
         self.location = self.location.lstrip('/')
         self.file_name_charset = file_name_charset
         
-        if not access_key and not secret_key:
-             access_key, secret_key = self._get_access_keys()
-        
-        self.connection = S3Connection(access_key, secret_key)
+        self.access_key = access_key
+        self.secret_key = secret_key
+
+        self._connection = None
+
+        try:
+            self.calling_format = getattr(connection, CALLING_FORMAT)
+        except AttributeError:
+            raise ImproperlyConfigured("Invalid CallingFormat subclass: %s\n"
+                "Valid choices: SubdomainCallingFormat, VHostCallingFormat, OrdinaryCallingFormat")
+
+
+    @property
+    def connection(self):
+        if self._connection is None:            
+            self._connection = connection.S3Connection(self.access_key, self.secret_key,
+                                                       calling_format=self.calling_format())
+        return self._connection
+
 
     @property
     def bucket(self):
@@ -106,24 +118,29 @@ class S3BotoStorage(Storage):
             self._bucket = self._get_or_create_bucket(self.bucket_name)
         return self._bucket
     
-    def _get_access_keys(self):
-        access_key = ACCESS_KEY_NAME
-        secret_key = SECRET_KEY_NAME
-        if (access_key or secret_key) and (not access_key or not secret_key):
-            access_key = os.environ.get(ACCESS_KEY_NAME)
-            secret_key = os.environ.get(SECRET_KEY_NAME)
-        
-        if access_key and secret_key:
-            # Both were provided, so use them
-            return access_key, secret_key
-        
-        return None, None
+    def _set_access_key(self, access_key):
+        self._access_key = access_key
+    
+    def _get_access_key(self):
+        if self._access_key is None:
+            self._access_key = getattr(settings, 'AWS_ACCESS_KEY_ID', os.environ.get('AWS_ACCESS_KEY_ID'))
+        return self._access_key
+    
+    secret_key = property(_get_access_key, _set_access_key)
+    
+    def _set_secret_key(self, secret_key):
+        self._secret_key = secret_key
+    
+    def _get_secret_key(self):
+        if self._secret_key is None:
+            self._secret_key = getattr(settings, 'AWS_SECRET_ACCESS_KEY', os.environ.get('AWS_SECRET_ACCESS_KEY'))
+        return self._secret_key
     
     def _get_or_create_bucket(self, name):
         """Retrieves a bucket if it exists, otherwise creates it."""
         try:
             return self.connection.get_bucket(name)
-        except S3ResponseError, e:
+        except connection.S3ResponseError:
             if AUTO_CREATE_BUCKET:
                 bucket = self.connection.create_bucket(name)
                 bucket.set_acl(self.bucket_acl)
@@ -213,12 +230,12 @@ class S3BotoStorage(Storage):
     
     def url(self, name):
         name = self._normalize_name(self._clean_name(name))
-        if self.custom_domain:
-            return "%s://%s/%s" % ('https' if self.secure_urls else 'http', self.custom_domain, name)
-        else:
-            return self.connection.generate_url(self.querystring_expire, method='GET', \
-                    bucket=self.bucket.name, key=self._encode_name(name), query_auth=self.querystring_auth, \
-                    force_http=not self.secure_urls)
+        return self.connection.generate_url(QUERYSTRING_EXPIRE,
+                                            method='GET',
+                                            bucket=self.bucket.name,
+                                            key=name,
+                                            query_auth=QUERYSTRING_AUTH,
+                                            force_http=FORCE_HTTP)
 
     def get_available_name(self, name):
         """ Overwrite existing file with the same name. """
